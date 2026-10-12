@@ -47,6 +47,11 @@
         <progress id="bar" value="0" max="1"></progress>
         <div class="progress-row"><span id="progress-text"></span><button type="button" id="cancel">Отмена</button></div>
       </div>
+      <div id="tile-legend" class="legend" hidden>
+        <span><i class="sw todo"></i>не посчитан</span>
+        <span><i class="sw run"></i>считается</span>
+        <span><i class="sw done"></i>посчитан</span>
+      </div>
       <p class="status" id="status"></p>
     </section>
 
@@ -56,8 +61,16 @@
     </section>
   </aside>
 
+  <dialog id="huge-dialog">
+    <p id="huge-text">Область очень большая (≈<span id="huge-count"></span> ячеек). Точный подсчёт может занять много
+      времени и памяти, поэтому он выключен. Это предупреждение показывается один раз до перезагрузки страницы:
+      включите «Точный подсчёт» снова, и дальше он будет считать область любого размера.</p>
+    <button type="button" id="huge-ok">Понятно</button>
+  </dialog>
+
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/h3-js.umd.js"></script>
+  <script src="vendor/polygon-clipping.umd.min.js"></script>
   <script src="tile.js"></script>
   <script src="app.js"></script>
 </body>

@@ -6,7 +6,8 @@
   var EARTH_RADIUS_M = 6371008.8;
   var DIRECT_LIMIT = 100000;  // up to this many (estimated) cells: one polygonToCells call
   var AUTO_LIMIT = 600000;    // up to this many: exact count is always done (tiled, with progress)
-  var HARD_LIMIT = 50000000;  // above this many even the exact mode refuses
+  var HUGE_LIMIT = 50000000;  // above this many (estimated) cells the exact mode warns once per page load
+  var TILE_DRAW_LIMIT = 3000; // tiles are highlighted on the map only if there are at most this many
   var TILE_TARGET = 40000;    // cells per tile in the tiled count
   var TILE_MARGIN_DEG = 0.0004; // ≈ 44 m, more than a cell diameter at resolution 12
   var RENDER_LIMIT = 20000;   // above this many cells they are not drawn on the map
@@ -24,22 +25,31 @@
   L.control.zoom({ position: 'topright' }).addTo(map);
 
   var cellsLayer = L.layerGroup().addTo(map);
+  var tilesLayer = L.layerGroup().addTo(map);
   var shapesLayer = L.layerGroup().addTo(map);
   var draftLayer = L.layerGroup().addTo(map);
 
   var $ = function (id) { return document.getElementById(id); };
   var mapEl = map.getContainer();
   var nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+  var nf1 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
   var nf3 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
 
-  // { latlngs, layer, results: { [containment]: { count, cells | null } }, declined, areaM2, estimate }
+  // Drawn shapes: { latlngs, layer }.
   var shapes = [];
+  // Union of all shapes: disjoint polygons { rings: [[lat, lng], ...] (outer + holes), areaM2, estimate, key }.
+  var polys = [];
+  var shapesAreaM2 = 0;         // sum of the areas of the drawn shapes (overlaps counted repeatedly)
+  var resultCache = new Map();  // polygon key + containment -> { count, cells | null }
+  var declined = new Set();     // polygon key + containment the user cancelled the exact count for
   var mode = 'poly';
   var draft = null;            // polygon mode: array of L.LatLng
   var draftLine = null, draftRubber = null;
   var freePts = null, freeLine = null, freePointer = null;
   var renderToken = 0;
   var cancelRequested = false;
+  var hugeWarned = false;      // the «very large area» popup is shown once until the page is reloaded
+  var announceExact = false;   // report the result of the recount triggered by the «exact» toggle
 
   var HINTS = {
     poly: 'Кликайте по карте, расставляя вершины. Закрыть: клик по первой точке, двойной клик или Enter. Esc — отмена.',
@@ -55,14 +65,62 @@
 
   // ---- geometry -----------------------------------------------------------
 
-  // Spherical polygon area, m² (same approach as Leaflet.draw).
-  function ringAreaM2(latlngs) {
-    var d2r = Math.PI / 180, sum = 0, n = latlngs.length;
+  // Spherical polygon area of a ring of [lat, lng], m² (same approach as Leaflet.draw).
+  function ringAreaM2(ring) {
+    var d2r = Math.PI / 180, sum = 0, n = ring.length;
     for (var i = 0; i < n; i++) {
-      var p1 = latlngs[i], p2 = latlngs[(i + 1) % n];
-      sum += (p2.lng - p1.lng) * d2r * (2 + Math.sin(p1.lat * d2r) + Math.sin(p2.lat * d2r));
+      var p1 = ring[i], p2 = ring[(i + 1) % n];
+      sum += (p2[1] - p1[1]) * d2r * (2 + Math.sin(p1[0] * d2r) + Math.sin(p2[0] * d2r));
     }
     return Math.abs(sum * EARTH_RADIUS_M * EARTH_RADIUS_M / 2);
+  }
+
+  function hashRings(rings) {
+    var h = 2166136261, points = 0;
+    rings.forEach(function (ring) {
+      h = Math.imul(h ^ ring.length, 16777619);
+      ring.forEach(function (pt) {
+        points++;
+        h = Math.imul(h ^ Math.round(pt[0] * 1e7), 16777619);
+        h = Math.imul(h ^ Math.round(pt[1] * 1e7), 16777619);
+      });
+    });
+    return (h >>> 0).toString(36) + ':' + rings.length + ':' + points;
+  }
+
+  function makePoly(rings) {
+    var area = ringAreaM2(rings[0]);
+    for (var i = 1; i < rings.length; i++) area -= ringAreaM2(rings[i]);
+    area = Math.max(area, 0);
+    return { rings: rings, areaM2: area, estimate: area / AVG_CELL_M2, key: hashRings(rings) };
+  }
+
+  function shapeRing(shape) {
+    return shape.latlngs.map(function (ll) { var w = ll.wrap(); return [w.lat, w.lng]; });
+  }
+
+  // Glues overlapping shapes together: the union of all drawn shapes as disjoint polygons with holes.
+  function rebuildGeometry() {
+    polys = [];
+    shapesAreaM2 = shapes.reduce(function (sum, sh) { return sum + ringAreaM2(shapeRing(sh)); }, 0);
+    if (!shapes.length) return;
+    var inputs = shapes.map(function (sh) {
+      var ring = shapeRing(sh).map(function (p) { return [p[1], p[0]]; });   // polygon-clipping wants [lng, lat]
+      ring.push(ring[0]);
+      return [ring];
+    });
+    var union;
+    try {
+      union = polygonClipping.union.apply(polygonClipping, inputs);
+    } catch (err) {
+      union = inputs;     // degenerate input: fall back to the shapes as they are
+    }
+    union.forEach(function (polygon) {
+      var rings = polygon.map(function (ring) {
+        return ring.slice(0, -1).map(function (p) { return [p[1], p[0]]; });  // back to [lat, lng], open ring
+      }).filter(function (ring) { return ring.length >= 3; });
+      if (rings.length) polys.push(makePoly(rings));
+    });
   }
 
   function cellBoundary(cell) {
@@ -79,12 +137,8 @@
 
   // ---- counting -----------------------------------------------------------
 
-  function shapeRing(shape) {
-    return shape.latlngs.map(function (ll) { var w = ll.wrap(); return [w.lat, w.lng]; });
-  }
-
-  function computeCells(shape, containment) {
-    return h3.polygonToCellsExperimental([shapeRing(shape)], RES, containment);
+  function computeCells(poly, containment) {
+    return h3.polygonToCellsExperimental(poly.rings, RES, containment);
   }
 
   // Sutherland–Hodgman clip of a [lat, lng] ring against one half-plane.
@@ -114,12 +168,30 @@
     return ring;
   }
 
+  // Clips a polygon with holes (rings[0] is the outer ring). Null if the outer ring does not reach the tile.
+  function clipRings(rings, lat0, lat1, lng0, lng1) {
+    var outer = clipRect(rings[0], lat0, lat1, lng0, lng1);
+    if (!outer) return null;
+    var out = [outer];
+    for (var i = 1; i < rings.length; i++) {
+      var hole = clipRect(rings[i], lat0, lat1, lng0, lng1);
+      if (hole) out.push(hole);
+    }
+    return out;
+  }
+
   var threadsParam = new URLSearchParams(location.search).get('threads');
   var THREADS = threadsParam !== null && !isNaN(parseInt(threadsParam, 10))
     ? Math.max(0, parseInt(threadsParam, 10))
     : Math.min(navigator.hardwareConcurrency || 4, 16);
   var currentRun = null;
   var threadsLabel = '';
+
+  var TILE_STYLES = {
+    todo: { color: '#6b7280', weight: 1, dashArray: '3 3', fillColor: '#9ca3af', fillOpacity: 0.12 },
+    run:  { color: '#d97706', weight: 1, dashArray: null, fillColor: '#f59e0b', fillOpacity: 0.45 },
+    done: { color: '#15803d', weight: 1, dashArray: null, fillColor: '#22c55e', fillOpacity: 0.2 }
+  };
 
   function showProgress(done, total) {
     $('progress').hidden = done === null;
@@ -130,15 +202,21 @@
       ' · ' + Math.round(done / total * 100) + '%' + threadsLabel;
   }
 
+  function clearTiles() {
+    tilesLayer.clearLayers();
+    $('tile-legend').hidden = true;
+  }
+
   function abortRun() {
     if (currentRun) currentRun.abort();
   }
 
-  // Runs the tasks on a pool of Web Workers. Resolves to the total count, null if aborted,
-  // or 'fallback' if workers are unavailable or failed (the caller then counts on the main thread).
-  function runInWorkers(tasks, containment, token, onDone) {
+  // Runs tiles on a pool of Web Workers. nextEntry() returns the next { task, rect } or null when the tiles
+  // are exhausted. Resolves to the total count, null if aborted, or 'fallback' if workers are unavailable
+  // or failed (the caller then counts on the main thread).
+  function runInWorkers(nextEntry, containment, token, onStart, onDone) {
     return new Promise(function (resolve) {
-      var workers = [], next = 0, finished = 0, count = 0, over = false;
+      var workers = [], inFlight = 0, count = 0, over = false;
 
       function end(result) {
         if (over) return;
@@ -150,22 +228,26 @@
       currentRun = { abort: function () { end(null); } };
 
       function feed(w) {
-        if (next < tasks.length) {
-          w.postMessage({ task: tasks[next++], res: RES, containment: containment });
-        }
+        var entry = nextEntry();
+        if (!entry) return;
+        w.entry = entry;
+        inFlight++;
+        onStart(entry);
+        w.postMessage({ task: entry.task, res: RES, containment: containment });
       }
 
-      var n = Math.min(THREADS, tasks.length);
       try {
-        for (var i = 0; i < n; i++) {
+        for (var i = 0; i < THREADS; i++) {
           var w = new Worker('worker.js');
           w.onmessage = function (e) {
+            var worker = e.target;
             count += e.data.count;
-            finished++;
-            onDone();
+            inFlight--;
+            onDone(worker.entry);
+            worker.entry = null;
             if (token !== renderToken || cancelRequested) return end(null);
-            if (finished === tasks.length) return end(count);
-            feed(e.target);
+            feed(worker);
+            if (inFlight === 0) end(count);
           };
           w.onerror = function () { end('fallback'); };
           workers.push(w);
@@ -174,6 +256,7 @@
         return end('fallback');
       }
       workers.forEach(feed);
+      if (inFlight === 0) end(count);
     });
   }
 
@@ -181,9 +264,11 @@
   // polygonToCells call (on the polygon clipped to the tile plus a margin) and only cells whose centre lies
   // in the tile are kept, so seams neither double-count nor lose cells. The result equals a single call.
   // Tiles are independent, so they run in parallel in Web Workers (THREADS of them; ?threads=0 disables).
+  // Tiles are built lazily, so the grid may be arbitrarily large without holding it all in memory. With a
+  // modest number of tiles they are drawn on the map: grey = not counted, amber = counting, green = counted.
   // Resolves to the count, or null if aborted (superseded by a newer recalc, or cancelled by the user).
-  async function countTiled(shape, containment, token) {
-    var ring = shapeRing(shape);
+  async function countTiled(poly, containment, token) {
+    var rings = poly.rings, ring = rings[0];
     var minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
     ring.forEach(function (p) {
       minLat = Math.min(minLat, p[0]); maxLat = Math.max(maxLat, p[0]);
@@ -197,49 +282,101 @@
     var nLng = Math.max(1, Math.ceil(wanted / nLat));
     var dLat = (maxLat - minLat) / nLat, dLng = (maxLng - minLng) / nLng;
     var total = nLat * nLng;
+    var draw = total <= TILE_DRAW_LIMIT;
+    var done = 0;                 // finished tiles, including those the polygon does not reach
 
-    var tasks = [];
-    for (var i = 0; i < nLat; i++) {
-      for (var j = 0; j < nLng; j++) {
-        var lat0 = minLat + i * dLat, lat1 = lat0 + dLat;
-        var lng0 = minLng + j * dLng, lng1 = lng0 + dLng;
-        var marginLng = TILE_MARGIN_DEG / Math.max(Math.cos(Math.max(Math.abs(lat0), Math.abs(lat1)) * Math.PI / 180), 0.05);
-        var clipped = clipRect(ring, lat0 - TILE_MARGIN_DEG, lat1 + TILE_MARGIN_DEG, lng0 - marginLng, lng1 + marginLng);
-        if (!clipped) continue;
-        tasks.push({
-          clipped: clipped,
+    // Builds tile idx: { task, rect } or null if the polygon does not reach it.
+    function buildTile(idx) {
+      var i = Math.floor(idx / nLng), j = idx % nLng;
+      var lat0 = minLat + i * dLat, lat1 = lat0 + dLat;
+      var lng0 = minLng + j * dLng, lng1 = lng0 + dLng;
+      var marginLng = TILE_MARGIN_DEG / Math.max(Math.cos(Math.max(Math.abs(lat0), Math.abs(lat1)) * Math.PI / 180), 0.05);
+      var clipped = clipRings(rings, lat0 - TILE_MARGIN_DEG, lat1 + TILE_MARGIN_DEG, lng0 - marginLng, lng1 + marginLng);
+      if (!clipped) return null;
+      var entry = {
+        task: {
+          rings: clipped,
           // Cells at the outer edge of the bounding box may have their centre outside it (overlap modes).
           loLat: i === 0 ? -Infinity : lat0, hiLat: i === nLat - 1 ? Infinity : lat1,
           loLng: j === 0 ? -Infinity : lng0, hiLng: j === nLng - 1 ? Infinity : lng1
-        });
+        },
+        rect: null
+      };
+      if (draw) {
+        entry.rect = L.rectangle([[lat0, lng0], [lat1, lng1]], Object.assign({ interactive: false }, TILE_STYLES.todo))
+          .addTo(tilesLayer);
+      }
+      return entry;
+    }
+
+    var cursor = 0, prebuilt = null;
+    if (draw) {
+      clearTiles();
+      $('tile-legend').hidden = false;
+      prebuilt = [];
+      for (var idx = 0; idx < total; idx++) {
+        var e = buildTile(idx);
+        if (e) prebuilt.push(e); else done++;
       }
     }
-    var skipped = total - tasks.length;   // tiles the polygon does not reach
+    function nextEntry() {
+      if (prebuilt) return cursor < prebuilt.length ? prebuilt[cursor++] : null;
+      while (cursor < total) {
+        var entry = buildTile(cursor++);
+        if (entry) return entry;
+        done++;
+      }
+      return null;
+    }
+    function onStart(entry) { if (entry.rect) entry.rect.setStyle(TILE_STYLES.run); }
+    function onDone(entry) {
+      if (entry.rect) entry.rect.setStyle(TILE_STYLES.done);
+      showProgress(++done, total);
+    }
 
-    if (THREADS > 0 && typeof Worker !== 'undefined') {
-      threadsLabel = ' · потоков: ' + Math.min(THREADS, tasks.length);
-      var done = skipped;
+    showProgress(done, total);
+    var useWorkers = THREADS > 0 && typeof Worker !== 'undefined';
+    var result;
+    if (useWorkers) {
+      threadsLabel = ' · потоков: ' + THREADS;
+      result = await runInWorkers(nextEntry, containment, token, onStart, onDone);
+    }
+    if (!useWorkers || result === 'fallback') {
+      if (result === 'fallback') {            // workers failed: start over on the main thread
+        cursor = 0;
+        if (prebuilt) prebuilt.forEach(function (en) { en.rect.setStyle(TILE_STYLES.todo); });
+        done = prebuilt ? total - prebuilt.length : 0;
+      }
+      threadsLabel = '';
       showProgress(done, total);
-      var result = await runInWorkers(tasks, containment, token, function () { showProgress(++done, total); });
-      if (result !== 'fallback') return result;
+      var count = 0, entry;
+      result = null;
+      while ((entry = nextEntry())) {
+        await yieldToUi();
+        if (token !== renderToken || cancelRequested) { count = null; break; }
+        onStart(entry);
+        await yieldToUi();                    // let the "counting" highlight be painted before the blocking call
+        count += countTile(h3, entry.task, RES, containment);
+        onDone(entry);
+      }
+      result = count;
     }
-
-    threadsLabel = '';
-    var count = 0;
-    showProgress(skipped, total);
-    for (var t = 0; t < tasks.length; t++) {
-      await yieldToUi();
-      if (token !== renderToken || cancelRequested) return null;
-      count += countTile(h3, tasks[t], RES, containment);
-      showProgress(skipped + t + 1, total);
-    }
-    return count;
+    if (result === null) clearTiles();
+    return result;
   }
 
   $('cancel').addEventListener('click', function () {
     cancelRequested = true;
     abortRun();
   });
+
+  function showHugeWarning(estimate) {
+    $('huge-count').textContent = nf0.format(Math.round(estimate));
+    var dlg = $('huge-dialog');
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else alert($('huge-text').textContent);
+  }
+  $('huge-ok').addEventListener('click', function () { $('huge-dialog').close(); });
 
   // Computes what is missing for the current options, then refreshes the numbers and the map.
   async function recalc() {
@@ -248,13 +385,30 @@
     cancelRequested = false;
     var containment = $('containment').value;
     var exactMode = $('exact').checked;
+    var announce = announceExact;
+    announceExact = false;
+    var startedAt = Date.now();
 
-    var pending = shapes.filter(function (s) {
-      if (s.results[containment]) return false;
-      if (s.estimate > HARD_LIMIT) return false;
-      if (s.estimate > AUTO_LIMIT) return exactMode;
-      return exactMode || s.declined !== containment;
-    });
+    function ckey(poly) { return poly.key + '|' + containment; }
+    function needsCount(poly) {
+      if (resultCache.has(ckey(poly))) return false;
+      if (poly.estimate > AUTO_LIMIT) return exactMode;
+      return exactMode || !declined.has(ckey(poly));
+    }
+    var pending = polys.filter(needsCount);
+
+    // A very large area: switch exact mode off and warn, once per page load. After that it counts anything.
+    if (exactMode && !hugeWarned) {
+      var huge = pending.filter(function (poly) { return poly.estimate > HUGE_LIMIT; })[0];
+      if (huge) {
+        hugeWarned = true;
+        exactMode = false;
+        $('exact').checked = false;
+        showHugeWarning(huge.estimate);
+        pending = polys.filter(needsCount);
+      }
+    }
+    clearTiles();
     if (pending.length) {
       setStatus('Считаю…');
       await yieldToUi();
@@ -262,28 +416,29 @@
     }
 
     for (var n = 0; n < pending.length; n++) {
-      var s = pending[n];
-      if (s.estimate <= DIRECT_LIMIT) {
-        var cells = computeCells(s, containment);
-        s.results[containment] = { count: cells.length, cells: cells };
+      var poly = pending[n];
+      if (poly.estimate <= DIRECT_LIMIT) {
+        var cells = computeCells(poly, containment);
+        resultCache.set(ckey(poly), { count: cells.length, cells: cells });
         continue;
       }
-      var count = await countTiled(s, containment, token);
+      var count = await countTiled(poly, containment, token);
       showProgress(null);
       if (count === null) {
         if (token !== renderToken) return;        // superseded: the newer recalc takes over
-        s.declined = containment;                 // cancelled by the user
-        if (s.estimate > AUTO_LIMIT) $('exact').checked = false;
+        declined.add(ckey(poly));                 // cancelled by the user
+        if (poly.estimate > AUTO_LIMIT) $('exact').checked = false;
         continue;
       }
-      s.results[containment] = { count: count, cells: null };
+      resultCache.set(ckey(poly), { count: count, cells: null });
     }
     showProgress(null);
 
+    // The polygons are disjoint pieces of the union, so their counts simply add up.
     var withCells = [], countOnly = [], approx = [];
-    shapes.forEach(function (s) {
-      var r = s.results[containment];
-      if (!r) approx.push(s);
+    polys.forEach(function (poly) {
+      var r = resultCache.get(ckey(poly));
+      if (!r) approx.push(poly);
       else if (r.cells) withCells.push(r);
       else countOnly.push(r);
     });
@@ -297,10 +452,10 @@
       all = Array.from(set);
     }
 
-    var approxTotal = approx.reduce(function (sum, s) { return sum + s.estimate; }, 0);
+    var approxTotal = approx.reduce(function (sum, poly) { return sum + poly.estimate; }, 0);
     var countOnlyTotal = countOnly.reduce(function (sum, r) { return sum + r.count; }, 0);
     var total = all.length + countOnlyTotal + Math.round(approxTotal);
-    var area = shapes.reduce(function (sum, s) { return sum + s.areaM2; }, 0) / 1e6;
+    var area = polys.reduce(function (sum, poly) { return sum + poly.areaM2; }, 0) / 1e6;
 
     $('count').textContent = (approx.length ? '≈ ' : '') + nf0.format(total);
     $('area').textContent = nf3.format(area);
@@ -308,14 +463,15 @@
     $('shapes').textContent = shapes.length;
 
     var msgs = [];
-    if (approx.length) {
-      var tooBig = approx.some(function (s) { return s.estimate > HARD_LIMIT; });
-      msgs.push(tooBig
-        ? 'Одна из областей больше ' + nf0.format(HARD_LIMIT) + ' ячеек — считается только оценка по площади.'
-        : 'Для больших областей показана оценка по площади. Включите «Точный подсчёт», чтобы посчитать точно.');
+    if (announce && !approx.length && shapes.length) {
+      var secs = (Date.now() - startedAt) / 1000;
+      msgs.push('Точный подсчёт выполнен' + (secs >= 1 ? ' за ' + nf1.format(secs) + ' с' : '') + '.');
     }
-    if (countOnly.length && shapes.length > 1) {
-      msgs.push('Пересечения больших фигур с другими вычитаются не полностью.');
+    if (approx.length) {
+      msgs.push('Для больших областей показана оценка по площади. Включите «Точный подсчёт», чтобы посчитать точно.');
+    }
+    if (shapes.length > 1 && shapesAreaM2 - area * 1e6 > shapesAreaM2 * 0.001) {
+      msgs.push('Пересекающиеся фигуры объединены: ячейки и площадь считаются один раз.');
     }
 
     cellsLayer.clearLayers();
@@ -339,14 +495,11 @@
       setStatus('Нужно минимум три точки.', true);
       return;
     }
-    var areaM2 = ringAreaM2(latlngs);
     var layer = L.polygon(latlngs, {
       color: '#b45309', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.08, interactive: false
     }).addTo(shapesLayer);
-    shapes.push({
-      latlngs: latlngs, layer: layer, results: {}, declined: null,
-      areaM2: areaM2, estimate: areaM2 / AVG_CELL_M2
-    });
+    shapes.push({ latlngs: latlngs, layer: layer });
+    rebuildGeometry();
     recalc();
   }
 
@@ -471,11 +624,24 @@
 
   $('containment').addEventListener('change', recalc);
   $('show-cells').addEventListener('change', recalc);
-  $('exact').addEventListener('change', recalc);
+  // Turning exact mode on recounts every drawn shape from scratch (also those already counted exactly),
+  // so the user always sees the recount run.
+  $('exact').addEventListener('change', function () {
+    if ($('exact').checked) {
+      var containment = $('containment').value;
+      polys.forEach(function (poly) {
+        resultCache.delete(poly.key + '|' + containment);
+        declined.delete(poly.key + '|' + containment);
+      });
+      announceExact = true;
+    }
+    recalc();
+  });
 
   $('undo').addEventListener('click', function () {
     var s = shapes.pop();
     if (s) shapesLayer.removeLayer(s.layer);
+    rebuildGeometry();
     recalc();
   });
 
@@ -483,6 +649,7 @@
     shapes = [];
     shapesLayer.clearLayers();
     resetDraft();
+    rebuildGeometry();
     recalc();
   });
 
@@ -492,5 +659,6 @@
   recalc();
 
   // Exposed for tests.
-  window.__h3calc = { map: map, shapes: function () { return shapes; } };
+  window.__h3calc = { map: map, shapes: function () { return shapes; }, polys: function () { return polys; },
+    tiles: function () { return tilesLayer.getLayers().map(function (l) { return l.options.fillColor; }); } };
 })();

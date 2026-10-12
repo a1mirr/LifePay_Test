@@ -78,6 +78,15 @@ progress { width: 100%; height: 10px; margin-top: 8px; }
 .progress-row button { padding: 2px 8px; font-size: 12px; }
 #progress[hidden] { display: none; }
 
+.legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.legend[hidden] { display: none; }
+.legend .sw { display: inline-block; width: 11px; height: 11px; margin-right: 4px; vertical-align: -1px; border: 1px solid; border-radius: 2px; }
+.sw.todo { border-color: #6b7280; border-style: dashed; background: rgba(156, 163, 175, .25); }
+.sw.run { border-color: #d97706; background: rgba(245, 158, 11, .6); }
+.sw.done { border-color: #15803d; background: rgba(34, 197, 94, .35); }
+dialog { max-width: 360px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; color: var(--fg); background: var(--bg); }
+dialog::backdrop { background: rgba(0, 0, 0, .35); }
+
 details summary { cursor: pointer; margin-bottom: 6px; }
 textarea {
   width: 100%;
