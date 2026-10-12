@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Калькулятор ячеек H3</title>
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <h1>Калькулятор ячеек H3</h1>
+    <p class="hint" id="scale"></p>
+
+    <section>
+      <div class="modes" role="group" aria-label="Инструмент">
+        <button type="button" id="mode-poly" class="active">Многоугольник</button>
+        <button type="button" id="mode-free">Свободная рука</button>
+        <button type="button" id="mode-pan">Карта</button>
+      </div>
+      <p class="hint" id="mode-hint"></p>
+      <button type="button" id="finish" hidden>Завершить фигуру</button>
+    </section>
+
+    <section>
+      <label for="containment">Какие ячейки считать</label>
+      <select id="containment">
+        <option value="containmentCenter">Центр ячейки внутри области</option>
+        <option value="containmentFull">Ячейка целиком внутри</option>
+        <option value="containmentOverlapping">Любое пересечение с областью</option>
+      </select>
+      <label class="check"><input type="checkbox" id="show-cells" checked> Показывать ячейки на карте</label>
+      <label class="check"><input type="checkbox" id="exact"> Точный подсчёт больших областей</label>
+      <p class="hint">Без него области больше ≈180 км² (600&nbsp;000 ячеек) считаются по площади, приблизительно.</p>
+    </section>
+
+    <section class="result" aria-live="polite">
+      <div class="big"><span id="count">0</span> <small>ячеек</small></div>
+      <dl>
+        <dt>Площадь области</dt><dd><span id="area">0</span> км²</dd>
+        <dt>Ячеек на км²</dt><dd id="density">—</dd>
+        <dt>Фигур</dt><dd id="shapes">0</dd>
+      </dl>
+      <div id="progress" hidden>
+        <progress id="bar" value="0" max="1"></progress>
+        <div class="progress-row"><span id="progress-text"></span><button type="button" id="cancel">Отмена</button></div>
+      </div>
+      <p class="status" id="status"></p>
+    </section>
+
+    <section class="actions">
+      <button type="button" id="undo">Удалить последнюю</button>
+      <button type="button" id="clear">Очистить всё</button>
+    </section>
+  </aside>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/h3-js.umd.js"></script>
+  <script src="tile.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
