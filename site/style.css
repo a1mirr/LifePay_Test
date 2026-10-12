@@ -56,7 +56,8 @@ button:hover { border-color: var(--accent); }
 button.active { color: var(--accent-fg); background: var(--accent); border-color: var(--accent); }
 
 .modes { display: flex; gap: 6px; }
-.modes button { flex: 1; }
+.modes button { flex: 1; padding: 6px 4px; }
+#finish { width: 100%; margin-top: 8px; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .result { padding: 10px 12px; background: #f3f6fb; border-radius: 8px; }
@@ -67,6 +68,10 @@ dt { color: var(--muted); }
 dd { margin: 0; text-align: right; }
 .status { min-height: 1.2em; margin: 8px 0 0; font-size: 12px; color: var(--muted); }
 .status.error { color: #b42318; }
+
+select { width: 100%; padding: 6px; font: inherit; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+label.check { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; }
+#map.draw { cursor: crosshair; touch-action: none; }
 
 details summary { cursor: pointer; margin-bottom: 6px; }
 textarea {

@@ -1,305 +1,299 @@
 (function () {
   'use strict';
 
-  var MAX_CELLS = 20000;
+  // H3 resolution 12: average cell ≈ 307 m², i.e. ≈ 3 256 cells per km².
+  var RES = 12;
   var EARTH_RADIUS_M = 6371008.8;
+  var EXACT_LIMIT = 600000;   // above this many (estimated) cells only an estimate is shown
+  var RENDER_LIMIT = 20000;   // above this many cells they are not drawn on the map
+  var CLOSE_PX = 12;          // click this close to the first vertex to close the polygon
+  var MIN_STEP_PX = 3;        // minimum distance between recorded points
 
-  var map = L.map('map', { preferCanvas: true, worldCopyJump: true, zoomControl: false }).setView([55.751, 37.618], 10);
+  var AVG_CELL_M2 = h3.getHexagonAreaAvg(RES, h3.UNITS.m2);
+
+  var map = L.map('map', { preferCanvas: true, worldCopyJump: true, zoomControl: false, doubleClickZoom: false })
+    .setView([55.751, 37.618], 15);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
   }).addTo(map);
   L.control.zoom({ position: 'topright' }).addTo(map);
+
   var cellsLayer = L.layerGroup().addTo(map);
+  var shapesLayer = L.layerGroup().addTo(map);
+  var draftLayer = L.layerGroup().addTo(map);
 
   var $ = function (id) { return document.getElementById(id); };
-  var resInput = $('res');
-  var statusEl = $('status');
+  var mapEl = map.getContainer();
+  var nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+  var nf3 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
 
-  // cell -> { layer, area (m²), res }
-  var selected = new Map();
-  // resolution -> Set of selected cells at that resolution
-  var byRes = new Map();
-  var totalArea = 0;
-  var mode = 'click';
+  // { latlngs, layer, cells: string[] | null, containment, areaM2, estimate }
+  var shapes = [];
+  var mode = 'poly';
+  var draft = null;            // polygon mode: array of L.LatLng
+  var draftLine = null, draftRubber = null;
+  var freePts = null, freeLine = null, freePointer = null;
+  var renderToken = 0;
 
-  var nf = function (digits) {
-    return new Intl.NumberFormat('ru-RU', { maximumFractionDigits: digits });
+  var HINTS = {
+    poly: 'Кликайте по карте, расставляя вершины. Закрыть: клик по первой точке, двойной клик или Enter. Esc — отмена.',
+    free: 'Зажмите кнопку мыши (или палец) и обведите область, отпустите — контур замкнётся.',
+    pan: 'Обычное перемещение карты, рисование выключено.'
   };
-  var fmtKm2 = nf(4), fmtHa = nf(2), fmtM2 = nf(0), fmtInt = nf(0);
 
   function setStatus(text, isError) {
-    statusEl.textContent = text || '';
-    statusEl.classList.toggle('error', !!isError);
+    var el = $('status');
+    el.textContent = text || '';
+    el.classList.toggle('error', !!isError);
   }
-
-  function currentRes() { return parseInt(resInput.value, 10); }
 
   // ---- geometry -----------------------------------------------------------
 
-  function boundaryLatLngs(cell) {
-    var ring = h3.cellToBoundary(cell); // [[lat, lng], ...]
-    var minLng = Infinity, maxLng = -Infinity;
-    ring.forEach(function (p) { minLng = Math.min(minLng, p[1]); maxLng = Math.max(maxLng, p[1]); });
-    // Cell crosses the antimeridian: shift western points so the polygon is not drawn across the world.
-    if (maxLng - minLng > 180) {
-      ring = ring.map(function (p) { return [p[0], p[1] < 0 ? p[1] + 360 : p[1]]; });
+  // Spherical polygon area, m² (same approach as Leaflet.draw).
+  function ringAreaM2(latlngs) {
+    var d2r = Math.PI / 180, sum = 0, n = latlngs.length;
+    for (var i = 0; i < n; i++) {
+      var p1 = latlngs[i], p2 = latlngs[(i + 1) % n];
+      sum += (p2.lng - p1.lng) * d2r * (2 + Math.sin(p1.lat * d2r) + Math.sin(p2.lat * d2r));
     }
+    return Math.abs(sum * EARTH_RADIUS_M * EARTH_RADIUS_M / 2);
+  }
+
+  function cellBoundary(cell) {
+    var ring = h3.cellToBoundary(cell);
+    var min = Infinity, max = -Infinity;
+    ring.forEach(function (p) { min = Math.min(min, p[1]); max = Math.max(max, p[1]); });
+    if (max - min > 180) ring = ring.map(function (p) { return [p[0], p[1] < 0 ? p[1] + 360 : p[1]]; });
     return ring;
   }
 
-  // ---- selection model ----------------------------------------------------
-
-  function register(cell, res) {
-    var area = h3.cellArea(cell, h3.UNITS.m2);
-    var layer = L.polygon(boundaryLatLngs(cell), {
-      color: '#1d4ed8', weight: 1, fillColor: '#3b82f6', fillOpacity: 0.35
-    }).addTo(cellsLayer);
-    selected.set(cell, { layer: layer, area: area, res: res });
-    if (!byRes.has(res)) byRes.set(res, new Set());
-    byRes.get(res).add(cell);
-    totalArea += area;
+  function nextFrame() {
+    return new Promise(function (resolve) { setTimeout(resolve, 30); });
   }
 
-  function unregister(cell) {
-    var rec = selected.get(cell);
-    if (!rec) return;
-    cellsLayer.removeLayer(rec.layer);
-    selected.delete(cell);
-    var set = byRes.get(rec.res);
-    set.delete(cell);
-    if (!set.size) byRes.delete(rec.res);
-    totalArea -= rec.area;
+  // ---- counting -----------------------------------------------------------
+
+  function computeCells(shape, containment) {
+    var ring = shape.latlngs.map(function (ll) { var w = ll.wrap(); return [w.lat, w.lng]; });
+    return h3.polygonToCellsExperimental([ring], RES, containment);
   }
 
-  // Returns the already selected cell that covers `cell` (itself or a coarser ancestor), if any.
-  function coveringCell(cell, res) {
-    var found = null;
-    byRes.forEach(function (set, r) {
-      if (found || r > res) return;
-      var candidate = r === res ? cell : h3.cellToParent(cell, r);
-      if (set.has(candidate)) found = candidate;
+  // Recomputes cells for shapes whose cached result is stale, then refreshes the numbers and the map.
+  async function recalc() {
+    var token = ++renderToken;
+    var containment = $('containment').value;
+    var stale = shapes.filter(function (s) { return s.containment !== containment; });
+    if (stale.length) {
+      setStatus('Считаю…');
+      await nextFrame();
+      if (token !== renderToken) return;
+    }
+
+    stale.forEach(function (s) {
+      s.containment = containment;
+      s.cells = s.estimate > EXACT_LIMIT ? null : computeCells(s, containment);
     });
-    return found;
-  }
 
-  // Adds cells of one resolution. Cells already covered by a coarser/equal selected cell are skipped,
-  // finer selected cells inside a new cell are replaced, so the area is never counted twice.
-  function addCells(cells, res) {
-    var fresh = [];
-    cells.forEach(function (cell) {
-      if (!coveringCell(cell, res)) fresh.push(cell);
-    });
-    if (!fresh.length) return 0;
+    var exact = shapes.filter(function (s) { return s.cells; });
+    var approx = shapes.filter(function (s) { return !s.cells; });
 
-    var freshSet = new Set(fresh);
-    var toRemove = [];
-    byRes.forEach(function (set, r) {
-      if (r <= res) return;
-      set.forEach(function (child) {
-        if (freshSet.has(h3.cellToParent(child, res))) toRemove.push(child);
-      });
-    });
-    toRemove.forEach(unregister);
-    fresh.forEach(function (cell) { register(cell, res); });
-    return fresh.length;
-  }
-
-  function clearAll() {
-    cellsLayer.clearLayers();
-    selected.clear();
-    byRes.clear();
-    totalArea = 0;
-  }
-
-  // ---- UI -----------------------------------------------------------------
-
-  function render() {
-    var m2 = Math.max(totalArea, 0);
-    $('area-km2').textContent = fmtKm2.format(m2 / 1e6);
-    $('area-ha').textContent = fmtHa.format(m2 / 1e4);
-    $('area-m2').textContent = fmtM2.format(m2);
-    $('count').textContent = fmtInt.format(selected.size);
-
-    var parts = [];
-    Array.from(byRes.keys()).sort(function (a, b) { return a - b; }).forEach(function (r) {
-      parts.push('r' + r + ': ' + fmtInt.format(byRes.get(r).size));
-    });
-    $('breakdown').textContent = parts.length ? parts.join(', ') : '—';
-
-    if ($('indexes-box').open) $('indexes').value = Array.from(selected.keys()).join('\n');
-  }
-
-  function updateResHint() {
-    var r = currentRes();
-    $('res-value').textContent = r;
-    $('res-hint').textContent = 'Средняя площадь ячейки: ' +
-      fmtKm2.format(h3.getHexagonAreaAvg(r, h3.UNITS.km2)) + ' км², ребро ≈ ' +
-      fmtKm2.format(h3.getHexagonEdgeLengthAvg(r, h3.UNITS.km)) + ' км';
-  }
-
-  function updateModeHint() {
-    $('mode-hint').textContent = mode === 'click'
-      ? 'Клик по карте добавляет ячейку, повторный клик убирает её.'
-      : 'Зажмите кнопку мыши и протяните рамку — добавятся ячейки, центры которых попали в рамку.';
-  }
-
-  function setMode(next) {
-    mode = next;
-    $('mode-click').classList.toggle('active', mode === 'click');
-    $('mode-frame').classList.toggle('active', mode === 'frame');
-    map.getContainer().style.cursor = mode === 'frame' ? 'crosshair' : '';
-    updateModeHint();
-  }
-
-  // ---- events -------------------------------------------------------------
-
-  resInput.addEventListener('input', updateResHint);
-  $('mode-click').addEventListener('click', function () { setMode('click'); });
-  $('mode-frame').addEventListener('click', function () { setMode('frame'); });
-
-  // Keep panel interactions from reaching the map.
-  L.DomEvent.disableClickPropagation($('panel'));
-  L.DomEvent.disableScrollPropagation($('panel'));
-
-  map.on('click', function (e) {
-    if (mode !== 'click') return;
-    var ll = e.latlng.wrap();
-    var res = currentRes();
-    var cell = h3.latLngToCell(ll.lat, ll.lng, res);
-
-    if (selected.has(cell)) {
-      unregister(cell);
-      setStatus('Ячейка убрана.');
+    var all;
+    if (exact.length === 1) {
+      all = exact[0].cells;
     } else {
-      var cover = coveringCell(cell, res);
-      if (cover) {
-        setStatus('Эта область уже входит в выбранную ячейку ' + cover + ' (r' + h3.getResolution(cover) + '). ' +
-          'Кликните по ней на этом же разрешении, чтобы убрать.');
+      var set = new Set();
+      exact.forEach(function (s) { s.cells.forEach(function (c) { set.add(c); }); });
+      all = Array.from(set);
+    }
+
+    var approxTotal = approx.reduce(function (sum, s) { return sum + s.estimate; }, 0);
+    var total = all.length + Math.round(approxTotal);
+    var area = shapes.reduce(function (sum, s) { return sum + s.areaM2; }, 0) / 1e6;
+
+    $('count').textContent = (approx.length ? '≈ ' : '') + nf0.format(total);
+    $('area').textContent = nf3.format(area);
+    $('density').textContent = area > 0 ? nf0.format(total / area) : '—';
+    $('shapes').textContent = shapes.length;
+
+    var msg = '';
+    if (approx.length) {
+      msg = 'Область слишком большая для точного подсчёта (больше ' + nf0.format(EXACT_LIMIT) +
+        ' ячеек), показана оценка по площади.';
+    }
+
+    cellsLayer.clearLayers();
+    if ($('show-cells').checked && all.length) {
+      if (all.length > RENDER_LIMIT) {
+        msg = (msg ? msg + ' ' : '') + 'Ячеек больше ' + nf0.format(RENDER_LIMIT) + ' — на карте не рисую.';
       } else {
-        addCells([cell], res);
-        setStatus('');
+        all.forEach(function (c) {
+          L.polygon(cellBoundary(c), {
+            color: '#1d4ed8', weight: 0.6, fillColor: '#3b82f6', fillOpacity: 0.3, interactive: false
+          }).addTo(cellsLayer);
+        });
       }
     }
-    render();
-  });
+    setStatus(msg, false);
+  }
 
-  // Frame selection
-  var frameStart = null;
-  var frameRect = null;
+  function addShape(latlngs) {
+    latlngs = latlngs.filter(function (ll, i) { return i === 0 || !ll.equals(latlngs[i - 1]); });
+    if (latlngs.length < 3) {
+      setStatus('Нужно минимум три точки.', true);
+      return;
+    }
+    var areaM2 = ringAreaM2(latlngs);
+    var layer = L.polygon(latlngs, {
+      color: '#b45309', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.08, interactive: false
+    }).addTo(shapesLayer);
+    shapes.push({
+      latlngs: latlngs, layer: layer, cells: null, containment: null,
+      areaM2: areaM2, estimate: areaM2 / AVG_CELL_M2
+    });
+    recalc();
+  }
 
-  map.on('mousedown', function (e) {
-    if (mode !== 'frame' || e.originalEvent.button !== 0) return;
-    frameStart = e.latlng;
-    map.dragging.disable();
-    frameRect = L.rectangle([frameStart, frameStart], {
-      color: '#b45309', weight: 1, dashArray: '4', fillOpacity: 0.08, interactive: false
-    }).addTo(map);
+  // ---- polygon drawing ----------------------------------------------------
+
+  function px(ll) { return map.latLngToContainerPoint(ll); }
+
+  function resetDraft() {
+    draft = null;
+    draftLayer.clearLayers();
+    draftLine = draftRubber = null;
+    $('finish').hidden = true;
+  }
+
+  function finishDraft() {
+    if (!draft) return;
+    var pts = draft;
+    resetDraft();
+    if (pts.length) addShape(pts);
+  }
+
+  function updateDraftLine(cursor) {
+    if (!draftLine) {
+      draftLine = L.polyline([], { color: '#b45309', weight: 2, interactive: false }).addTo(draftLayer);
+      draftRubber = L.polyline([], { color: '#b45309', weight: 1, dashArray: '4', interactive: false }).addTo(draftLayer);
+    }
+    draftLine.setLatLngs(draft);
+    var last = draft[draft.length - 1];
+    draftRubber.setLatLngs(cursor && last ? [last, cursor, draft[0]] : []);
+  }
+
+  map.on('click', function (e) {
+    if (mode !== 'poly') return;
+    if (!draft) {
+      draft = [];
+      $('finish').hidden = false;
+    }
+    var p = px(e.latlng);
+    if (draft.length >= 3 && p.distanceTo(px(draft[0])) <= CLOSE_PX) {
+      finishDraft();
+      return;
+    }
+    // Second click of a double-click lands on the same spot: ignore it as a new vertex.
+    if (draft.length && p.distanceTo(px(draft[draft.length - 1])) < MIN_STEP_PX) return;
+    draft.push(e.latlng);
+    if (draft.length === 1) {
+      L.circleMarker(e.latlng, {
+        radius: 5, color: '#b45309', fillColor: '#fff', fillOpacity: 1, weight: 2, interactive: false
+      }).addTo(draftLayer);
+    }
+    updateDraftLine(null);
   });
 
   map.on('mousemove', function (e) {
-    if (frameRect) frameRect.setBounds(L.latLngBounds(frameStart, e.latlng));
+    if (mode === 'poly' && draft && draft.length) updateDraftLine(e.latlng);
   });
 
-  function finishFrame(e) {
-    if (!frameRect) return;
-    var bounds = L.latLngBounds(frameStart, e.latlng);
-    map.removeLayer(frameRect);
-    frameRect = null;
-    frameStart = null;
-    map.dragging.enable();
-    fillBounds(bounds);
+  map.on('dblclick', function () {
+    if (mode === 'poly' && draft) finishDraft();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && draft) finishDraft();
+    if (e.key === 'Escape' && draft) resetDraft();
+  });
+
+  $('finish').addEventListener('click', finishDraft);
+
+  // ---- freehand drawing ---------------------------------------------------
+
+  mapEl.addEventListener('pointerdown', function (e) {
+    if (mode !== 'free' || e.button !== 0 || freePts) return;
+    freePointer = e.pointerId;
+    mapEl.setPointerCapture(e.pointerId);
+    freePts = [map.mouseEventToLatLng(e)];
+    freeLine = L.polyline(freePts, { color: '#b45309', weight: 2, interactive: false }).addTo(draftLayer);
+    e.preventDefault();
+  });
+
+  mapEl.addEventListener('pointermove', function (e) {
+    if (!freePts || e.pointerId !== freePointer) return;
+    var ll = map.mouseEventToLatLng(e);
+    if (px(ll).distanceTo(px(freePts[freePts.length - 1])) < MIN_STEP_PX) return;
+    freePts.push(ll);
+    freeLine.setLatLngs(freePts);
+  });
+
+  function endFree(e) {
+    if (!freePts || e.pointerId !== freePointer) return;
+    var pts = freePts;
+    freePts = null;
+    freePointer = null;
+    freeLine = null;
+    draftLayer.clearLayers();
+    if (pts.length >= 3) addShape(pts);
+    else setStatus('Контур слишком короткий — обведите область.', true);
   }
-  map.on('mouseup', finishFrame);
+  mapEl.addEventListener('pointerup', endFree);
+  mapEl.addEventListener('pointercancel', endFree);
 
-  function fillBounds(bounds) {
-    var res = currentRes();
-    var south = Math.max(bounds.getSouth(), -85), north = Math.min(bounds.getNorth(), 85);
-    var west = bounds.getWest(), east = bounds.getEast();
-    var latSpan = (north - south) * Math.PI / 180;
-    var lngSpan = (east - west) * Math.PI / 180;
-    var midLat = (north + south) / 2 * Math.PI / 180;
-    var rectArea = Math.abs(latSpan * lngSpan * Math.cos(midLat)) * EARTH_RADIUS_M * EARTH_RADIUS_M;
-    var estimate = rectArea / h3.getHexagonAreaAvg(res, h3.UNITS.m2);
+  // ---- modes & controls ---------------------------------------------------
 
-    if (estimate > MAX_CELLS) {
-      setStatus('Слишком много ячеек (≈' + fmtInt.format(estimate) + ', максимум ' + fmtInt.format(MAX_CELLS) +
-        '). Уменьшите рамку или понизьте разрешение.', true);
-      return;
-    }
-
-    var ring = [[south, west], [north, west], [north, east], [south, east]];
-    var cells = h3.polygonToCells([ring], res);
-    if (!cells.length) {
-      // Frame is smaller than a cell: take the cell under its centre.
-      var c = bounds.getCenter().wrap();
-      cells = [h3.latLngToCell(c.lat, c.lng, res)];
-    }
-    var added = addCells(cells, res);
-    setStatus(added ? 'Добавлено ячеек: ' + fmtInt.format(added) + '.' : 'Эта область уже выбрана.');
-    render();
+  function setMode(next) {
+    resetDraft();
+    mode = next;
+    ['poly', 'free', 'pan'].forEach(function (m) {
+      $('mode-' + m).classList.toggle('active', m === next);
+    });
+    mapEl.classList.toggle('draw', next === 'free');
+    mapEl.style.cursor = next === 'poly' ? 'crosshair' : '';
+    if (next === 'free') map.dragging.disable(); else map.dragging.enable();
+    $('mode-hint').textContent = HINTS[next];
   }
+
+  ['poly', 'free', 'pan'].forEach(function (m) {
+    $('mode-' + m).addEventListener('click', function () { setMode(m); });
+  });
+
+  // Panel clicks must not reach the map as drawing clicks.
+  L.DomEvent.disableClickPropagation($('panel'));
+  L.DomEvent.disableScrollPropagation($('panel'));
+
+  $('containment').addEventListener('change', recalc);
+  $('show-cells').addEventListener('change', recalc);
+
+  $('undo').addEventListener('click', function () {
+    var s = shapes.pop();
+    if (s) shapesLayer.removeLayer(s.layer);
+    recalc();
+  });
 
   $('clear').addEventListener('click', function () {
-    clearAll();
-    setStatus('');
-    render();
+    shapes = [];
+    shapesLayer.clearLayers();
+    resetDraft();
+    recalc();
   });
 
-  $('fit').addEventListener('click', function () {
-    var bounds = L.latLngBounds([]);
-    selected.forEach(function (rec) { bounds.extend(rec.layer.getBounds()); });
-    if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30] });
-  });
+  $('scale').textContent = 'Разрешение H3: ' + RES + ' · средняя ячейка ' + nf0.format(AVG_CELL_M2) +
+    ' м² · ≈' + nf0.format(1e6 / AVG_CELL_M2) + ' ячеек на км²';
+  setMode('poly');
+  recalc();
 
-  $('copy').addEventListener('click', function () {
-    var text = Array.from(selected.keys()).join('\n');
-    if (!text) { setStatus('Нечего копировать.'); return; }
-    var done = function () { setStatus('Индексы скопированы: ' + fmtInt.format(selected.size) + '.'); };
-    var fail = function () {
-      $('indexes-box').open = true;
-      $('indexes').value = text;
-      $('indexes').select();
-      setStatus('Не удалось скопировать автоматически — выделите текст в поле ниже.', true);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, fail);
-    } else {
-      fail();
-    }
-  });
-
-  $('indexes-box').addEventListener('toggle', function () {
-    if ($('indexes-box').open) $('indexes').value = Array.from(selected.keys()).join('\n');
-  });
-
-  $('add-indexes').addEventListener('click', function () {
-    var tokens = $('indexes').value.split(/[\s,;]+/).filter(Boolean);
-    var valid = {}, invalid = 0;
-    tokens.forEach(function (t) {
-      t = t.toLowerCase();
-      if (h3.isValidCell(t)) {
-        var r = h3.getResolution(t);
-        (valid[r] = valid[r] || []).push(t);
-      } else {
-        invalid++;
-      }
-    });
-    var total = 0;
-    Object.keys(valid).map(Number).sort(function (a, b) { return a - b; }).forEach(function (r) {
-      total += addCells(valid[r], r);
-    });
-    setStatus('Добавлено ячеек: ' + fmtInt.format(total) + (invalid ? ', некорректных индексов: ' + invalid : '') + '.', invalid > 0 && !total);
-    render();
-    $('fit').click();
-  });
-
-  updateResHint();
-  updateModeHint();
-  render();
-
-  // Exposed for debugging / tests.
-  window.__h3calc = { addCells: addCells, clearAll: clearAll, render: render, state: function () {
-    return { count: selected.size, areaM2: totalArea };
-  } };
+  // Exposed for tests.
+  window.__h3calc = { shapes: function () { return shapes; } };
 })();
