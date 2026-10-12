@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Калькулятор ячеек H3</title>
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=__VERSION__">
 </head>
 <body>
   <div id="map"></div>
@@ -59,6 +59,7 @@
       <button type="button" id="undo">Удалить последнюю</button>
       <button type="button" id="clear">Очистить всё</button>
     </section>
+    <p class="hint" id="version"></p>
   </aside>
 
   <dialog id="huge-dialog">
@@ -71,7 +72,7 @@
   <script src="vendor/leaflet/leaflet.js"></script>
   <script src="vendor/h3-js.umd.js"></script>
   <script src="vendor/polygon-clipping.umd.min.js"></script>
-  <script src="tile.js"></script>
-  <script src="app.js"></script>
+  <script src="tile.js?v=__VERSION__"></script>
+  <script src="app.js?v=__VERSION__"></script>
 </body>
 </html>

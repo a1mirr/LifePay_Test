@@ -16,6 +16,9 @@
 
   var AVG_CELL_M2 = h3.getHexagonAreaAvg(RES, h3.UNITS.m2);
 
+  // Stamped with the commit hash by the deploy workflow; stays a placeholder when run locally.
+  var APP_VERSION = '__VERSION__';
+
   var map = L.map('map', { preferCanvas: true, worldCopyJump: true, zoomControl: false, doubleClickZoom: false })
     .setView([55.751, 37.618], 15);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -29,6 +32,7 @@
   var draftLayer = L.layerGroup().addTo(map);
 
   var $ = function (id) { return document.getElementById(id); };
+  $('version').textContent = 'версия ' + (APP_VERSION.indexOf('__') === 0 ? 'dev' : APP_VERSION);
   var mapEl = map.getContainer();
   var nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
   var nf1 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
@@ -338,7 +342,7 @@
 
       try {
         for (var i = 0; i < THREADS; i++) {
-          var w = new Worker('worker.js');
+          var w = new Worker('worker.js?v=' + APP_VERSION);
           w.onmessage = function (e) {
             var worker = e.target;
             count += e.data.count;
@@ -388,14 +392,15 @@
     var grid = { minLat: minLat, minLng: minLng, dLat: dLat, dLng: dLng, nLat: nLat, nLng: nLng, states: null };
     grid.states = reachableTiles(rings, grid);
     clearTiles();
+    var layer = null;             // this run's own layer: a superseded run must not touch the next run's one
     if (grid.states) {
-      gridLayer = new TileGrid(grid).addTo(map);
+      layer = gridLayer = new TileGrid(grid).addTo(map);
       $('tile-legend').hidden = false;
     }
     function setState(idx, state) {
-      if (!grid.states) return;
+      if (!layer) return;
       grid.states[idx] = state;
-      gridLayer.touch();
+      layer.touch();
     }
 
     // Builds tile idx: { task, idx } or null if the polygon does not reach it.
@@ -463,7 +468,13 @@
       }
       return result;
     } finally {
-      clearTiles();
+      if (layer) {
+        map.removeLayer(layer);
+        if (gridLayer === layer) {
+          gridLayer = null;
+          $('tile-legend').hidden = true;
+        }
+      }
     }
   }
 
