@@ -7,7 +7,7 @@
   var DIRECT_LIMIT = 100000;  // up to this many (estimated) cells: one polygonToCells call
   var AUTO_LIMIT = 600000;    // up to this many: exact count is always done (tiled, with progress)
   var HUGE_LIMIT = 50000000;  // above this many (estimated) cells the exact mode warns once per page load
-  var TILE_DRAW_LIMIT = 3000; // tiles are highlighted on the map only if there are at most this many
+  var MAX_GRID_TILES = 4000000; // the tile highlight is skipped for grids with more tiles than this
   var TILE_TARGET = 40000;    // cells per tile in the tiled count
   var TILE_MARGIN_DEG = 0.0004; // ≈ 44 m, more than a cell diameter at resolution 12
   var RENDER_LIMIT = 20000;   // above this many cells they are not drawn on the map
@@ -25,7 +25,6 @@
   L.control.zoom({ position: 'topright' }).addTo(map);
 
   var cellsLayer = L.layerGroup().addTo(map);
-  var tilesLayer = L.layerGroup().addTo(map);
   var shapesLayer = L.layerGroup().addTo(map);
   var draftLayer = L.layerGroup().addTo(map);
 
@@ -187,11 +186,114 @@
   var currentRun = null;
   var threadsLabel = '';
 
-  var TILE_STYLES = {
-    todo: { color: '#6b7280', weight: 1, dashArray: '3 3', fillColor: '#9ca3af', fillOpacity: 0.12 },
-    run:  { color: '#d97706', weight: 1, dashArray: null, fillColor: '#f59e0b', fillOpacity: 0.45 },
-    done: { color: '#15803d', weight: 1, dashArray: null, fillColor: '#22c55e', fillOpacity: 0.2 }
-  };
+  // ---- tile highlight: one canvas, one byte of state per tile ---------------
+
+  var TILE_TODO = 1, TILE_RUN = 2, TILE_DONE = 3;   // 0 = tile not reached by the polygon, not drawn
+  var TILE_FILL = [null, 'rgba(156,163,175,0.14)', 'rgba(245,158,11,0.5)', 'rgba(34,197,94,0.22)'];
+  var TILE_STROKE = [null, 'rgba(107,114,128,0.7)', 'rgba(217,119,6,0.9)', 'rgba(21,128,61,0.7)'];
+
+  // Draws the tile grid { minLat, minLng, dLat, dLng, nLat, nLng, states } over the map. Only the tiles in the
+  // view are drawn, so even a grid of hundreds of thousands of tiles costs one cheap canvas repaint.
+  var TileGrid = L.Layer.extend({
+    initialize: function (grid) { this.grid = grid; this._frame = 0; this._timer = 0; },
+
+    onAdd: function (m) {
+      this._canvas = L.DomUtil.create('canvas', 'tile-grid leaflet-zoom-hide');
+      m.getPanes().overlayPane.appendChild(this._canvas);
+      m.on('move zoomend viewreset resize', this.invalidate, this);
+      this.invalidate();
+    },
+
+    onRemove: function (m) {
+      m.off('move zoomend viewreset resize', this.invalidate, this);
+      if (this._frame) cancelAnimationFrame(this._frame);
+      if (this._timer) clearTimeout(this._timer);
+      this._frame = this._timer = 0;
+      L.DomUtil.remove(this._canvas);
+    },
+
+    invalidate: function () {
+      if (this._frame || !this._map) return;
+      var self = this;
+      this._frame = requestAnimationFrame(function () { self._frame = 0; self._draw(); });
+    },
+
+    // Tile states change very often while counting; repaint at most every 120 ms.
+    touch: function () {
+      if (this._timer || !this._map) return;
+      var self = this;
+      this._timer = setTimeout(function () { self._timer = 0; self.invalidate(); }, 120);
+    },
+
+    _draw: function () {
+      var map = this._map, g = this.grid, c = this._canvas;
+      if (!map) return;
+      var size = map.getSize();
+      if (c.width !== size.x || c.height !== size.y) { c.width = size.x; c.height = size.y; }
+      L.DomUtil.setPosition(c, map.containerPointToLayerPoint([0, 0]));
+      var ctx = c.getContext('2d');
+      ctx.clearRect(0, 0, c.width, c.height);
+
+      var b = map.getBounds();
+      var i0 = Math.max(0, Math.floor((b.getSouth() - g.minLat) / g.dLat));
+      var i1 = Math.min(g.nLat - 1, Math.floor((b.getNorth() - g.minLat) / g.dLat));
+      var j0 = Math.max(0, Math.floor((b.getWest() - g.minLng) / g.dLng));
+      var j1 = Math.min(g.nLng - 1, Math.floor((b.getEast() - g.minLng) / g.dLng));
+      if (i0 > i1 || j0 > j1) return;
+
+      var xs = [], ys = [], i, j;
+      for (j = j0; j <= j1 + 1; j++) xs.push(map.latLngToContainerPoint([g.minLat, g.minLng + j * g.dLng]).x);
+      for (i = i0; i <= i1 + 1; i++) ys.push(map.latLngToContainerPoint([g.minLat + i * g.dLat, g.minLng]).y);
+
+      var last = -1;
+      for (i = i0; i <= i1; i++) {
+        var top = ys[i - i0 + 1], h = ys[i - i0] - top;
+        for (j = j0; j <= j1; j++) {
+          var st = g.states[i * g.nLng + j];
+          if (!st) continue;
+          if (st !== last) { ctx.fillStyle = TILE_FILL[st]; ctx.strokeStyle = TILE_STROKE[st]; last = st; }
+          var x = xs[j - j0], w = xs[j - j0 + 1] - x;
+          ctx.fillRect(x, top, w, h);
+          if (w >= 6 && h >= 6) ctx.strokeRect(x + 0.5, top + 0.5, w - 1, h - 1);
+        }
+      }
+    }
+  });
+
+  var gridLayer = null;
+
+  function clearTiles() {
+    if (gridLayer) { map.removeLayer(gridLayer); gridLayer = null; }
+    $('tile-legend').hidden = true;
+  }
+
+  // Marks which tiles of the grid the polygon touches: the polygon is rasterised at one pixel per tile.
+  // Purely cosmetic (the count itself clips exactly); returns null if the grid is too big or degenerate.
+  function reachableTiles(rings, g) {
+    var n = g.nLat * g.nLng;
+    if (n > MAX_GRID_TILES || !(g.dLat > 0) || !(g.dLng > 0)) return null;
+    var canvas = document.createElement('canvas');
+    canvas.width = g.nLng;
+    canvas.height = g.nLat;
+    var ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.beginPath();
+    rings.forEach(function (ring) {
+      ring.forEach(function (pt, k) {
+        var x = (pt[1] - g.minLng) / g.dLng, y = (pt[0] - g.minLat) / g.dLat;
+        if (k === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+    });
+    ctx.fillStyle = '#000';
+    ctx.fill('evenodd');
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = '#000';
+    ctx.stroke();
+    var data = ctx.getImageData(0, 0, g.nLng, g.nLat).data;
+    var states = new Uint8Array(n);
+    for (var k = 0; k < n; k++) if (data[4 * k + 3] > 0) states[k] = TILE_TODO;
+    return states;
+  }
 
   function showProgress(done, total) {
     $('progress').hidden = done === null;
@@ -200,11 +302,6 @@
     $('bar').value = done;
     $('progress-text').textContent = 'Тайл ' + nf0.format(done) + ' из ' + nf0.format(total) +
       ' · ' + Math.round(done / total * 100) + '%' + threadsLabel;
-  }
-
-  function clearTiles() {
-    tilesLayer.clearLayers();
-    $('tile-legend').hidden = true;
   }
 
   function abortRun() {
@@ -264,8 +361,9 @@
   // polygonToCells call (on the polygon clipped to the tile plus a margin) and only cells whose centre lies
   // in the tile are kept, so seams neither double-count nor lose cells. The result equals a single call.
   // Tiles are independent, so they run in parallel in Web Workers (THREADS of them; ?threads=0 disables).
-  // Tiles are built lazily, so the grid may be arbitrarily large without holding it all in memory. With a
-  // modest number of tiles they are drawn on the map: grey = not counted, amber = counting, green = counted.
+  // Tiles are built lazily, so the grid may be arbitrarily large without holding it all in memory. While
+  // counting, the grid is drawn on the map: grey = not counted, amber = counting, green = counted; it is
+  // removed as soon as the count is over.
   // Resolves to the count, or null if aborted (superseded by a newer recalc, or cancelled by the user).
   async function countTiled(poly, containment, token) {
     var rings = poly.rings, ring = rings[0];
@@ -282,45 +380,42 @@
     var nLng = Math.max(1, Math.ceil(wanted / nLat));
     var dLat = (maxLat - minLat) / nLat, dLng = (maxLng - minLng) / nLng;
     var total = nLat * nLng;
-    var draw = total <= TILE_DRAW_LIMIT;
     var done = 0;                 // finished tiles, including those the polygon does not reach
 
-    // Builds tile idx: { task, rect } or null if the polygon does not reach it.
+    var grid = { minLat: minLat, minLng: minLng, dLat: dLat, dLng: dLng, nLat: nLat, nLng: nLng, states: null };
+    grid.states = reachableTiles(rings, grid);
+    clearTiles();
+    if (grid.states) {
+      gridLayer = new TileGrid(grid).addTo(map);
+      $('tile-legend').hidden = false;
+    }
+    function setState(idx, state) {
+      if (!grid.states) return;
+      grid.states[idx] = state;
+      gridLayer.touch();
+    }
+
+    // Builds tile idx: { task, idx } or null if the polygon does not reach it.
     function buildTile(idx) {
       var i = Math.floor(idx / nLng), j = idx % nLng;
       var lat0 = minLat + i * dLat, lat1 = lat0 + dLat;
       var lng0 = minLng + j * dLng, lng1 = lng0 + dLng;
       var marginLng = TILE_MARGIN_DEG / Math.max(Math.cos(Math.max(Math.abs(lat0), Math.abs(lat1)) * Math.PI / 180), 0.05);
       var clipped = clipRings(rings, lat0 - TILE_MARGIN_DEG, lat1 + TILE_MARGIN_DEG, lng0 - marginLng, lng1 + marginLng);
-      if (!clipped) return null;
-      var entry = {
+      if (!clipped) { setState(idx, 0); return null; }
+      return {
+        idx: idx,
         task: {
           rings: clipped,
           // Cells at the outer edge of the bounding box may have their centre outside it (overlap modes).
           loLat: i === 0 ? -Infinity : lat0, hiLat: i === nLat - 1 ? Infinity : lat1,
           loLng: j === 0 ? -Infinity : lng0, hiLng: j === nLng - 1 ? Infinity : lng1
-        },
-        rect: null
+        }
       };
-      if (draw) {
-        entry.rect = L.rectangle([[lat0, lng0], [lat1, lng1]], Object.assign({ interactive: false }, TILE_STYLES.todo))
-          .addTo(tilesLayer);
-      }
-      return entry;
     }
 
-    var cursor = 0, prebuilt = null;
-    if (draw) {
-      clearTiles();
-      $('tile-legend').hidden = false;
-      prebuilt = [];
-      for (var idx = 0; idx < total; idx++) {
-        var e = buildTile(idx);
-        if (e) prebuilt.push(e); else done++;
-      }
-    }
+    var cursor = 0;
     function nextEntry() {
-      if (prebuilt) return cursor < prebuilt.length ? prebuilt[cursor++] : null;
       while (cursor < total) {
         var entry = buildTile(cursor++);
         if (entry) return entry;
@@ -328,41 +423,45 @@
       }
       return null;
     }
-    function onStart(entry) { if (entry.rect) entry.rect.setStyle(TILE_STYLES.run); }
+    function onStart(entry) { setState(entry.idx, TILE_RUN); }
     function onDone(entry) {
-      if (entry.rect) entry.rect.setStyle(TILE_STYLES.done);
+      setState(entry.idx, TILE_DONE);
       showProgress(++done, total);
     }
 
-    showProgress(done, total);
-    var useWorkers = THREADS > 0 && typeof Worker !== 'undefined';
-    var result;
-    if (useWorkers) {
-      threadsLabel = ' · потоков: ' + THREADS;
-      result = await runInWorkers(nextEntry, containment, token, onStart, onDone);
-    }
-    if (!useWorkers || result === 'fallback') {
-      if (result === 'fallback') {            // workers failed: start over on the main thread
-        cursor = 0;
-        if (prebuilt) prebuilt.forEach(function (en) { en.rect.setStyle(TILE_STYLES.todo); });
-        done = prebuilt ? total - prebuilt.length : 0;
-      }
-      threadsLabel = '';
+    try {
       showProgress(done, total);
-      var count = 0, entry;
-      result = null;
-      while ((entry = nextEntry())) {
-        await yieldToUi();
-        if (token !== renderToken || cancelRequested) { count = null; break; }
-        onStart(entry);
-        await yieldToUi();                    // let the "counting" highlight be painted before the blocking call
-        count += countTile(h3, entry.task, RES, containment);
-        onDone(entry);
+      var useWorkers = THREADS > 0 && typeof Worker !== 'undefined';
+      var result;
+      if (useWorkers) {
+        threadsLabel = ' · потоков: ' + THREADS;
+        result = await runInWorkers(nextEntry, containment, token, onStart, onDone);
       }
-      result = count;
+      if (!useWorkers || result === 'fallback') {
+        if (result === 'fallback') {          // workers failed: start over on the main thread
+          cursor = 0;
+          done = 0;
+          if (grid.states) {
+            for (var k = 0; k < grid.states.length; k++) if (grid.states[k] > TILE_TODO) grid.states[k] = TILE_TODO;
+          }
+        }
+        threadsLabel = '';
+        showProgress(done, total);
+        var count = 0, entry;
+        while ((entry = nextEntry())) {
+          await yieldToUi();
+          if (token !== renderToken || cancelRequested) { count = null; break; }
+          onStart(entry);
+          await yieldToUi();                  // let the "counting" highlight be painted before the blocking call
+          count += countTile(h3, entry.task, RES, containment);
+          onDone(entry);
+        }
+        result = count;
+      }
+      return result;
+    } finally {
+      clearTiles();
     }
-    if (result === null) clearTiles();
-    return result;
   }
 
   $('cancel').addEventListener('click', function () {
@@ -660,5 +759,10 @@
 
   // Exposed for tests.
   window.__h3calc = { map: map, shapes: function () { return shapes; }, polys: function () { return polys; },
-    tiles: function () { return tilesLayer.getLayers().map(function (l) { return l.options.fillColor; }); } };
+    tiles: function () {
+      if (!gridLayer) return null;
+      var t = { todo: 0, run: 0, done: 0 }, st = gridLayer.grid.states;
+      for (var k = 0; k < st.length; k++) { if (st[k] === 1) t.todo++; else if (st[k] === 2) t.run++; else if (st[k] === 3) t.done++; }
+      return t;
+    } };
 })();
