@@ -30,6 +30,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var mapEl = map.getContainer();
   var nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
+  var nf1 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
   var nf3 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
 
   // { latlngs, layer, results: { [containment]: { count, cells | null } }, declined, areaM2, estimate }
@@ -40,6 +41,7 @@
   var freePts = null, freeLine = null, freePointer = null;
   var renderToken = 0;
   var cancelRequested = false;
+  var announceExact = false;   // report the result of the recount triggered by the «exact» toggle
 
   var HINTS = {
     poly: 'Кликайте по карте, расставляя вершины. Закрыть: клик по первой точке, двойной клик или Enter. Esc — отмена.',
@@ -248,6 +250,9 @@
     cancelRequested = false;
     var containment = $('containment').value;
     var exactMode = $('exact').checked;
+    var announce = announceExact;
+    announceExact = false;
+    var startedAt = Date.now();
 
     var pending = shapes.filter(function (s) {
       if (s.results[containment]) return false;
@@ -308,6 +313,10 @@
     $('shapes').textContent = shapes.length;
 
     var msgs = [];
+    if (announce && !approx.length && shapes.length) {
+      var secs = (Date.now() - startedAt) / 1000;
+      msgs.push('Точный подсчёт выполнен' + (secs >= 1 ? ' за ' + nf1.format(secs) + ' с' : '') + '.');
+    }
     if (approx.length) {
       var tooBig = approx.some(function (s) { return s.estimate > HARD_LIMIT; });
       msgs.push(tooBig
@@ -471,7 +480,16 @@
 
   $('containment').addEventListener('change', recalc);
   $('show-cells').addEventListener('change', recalc);
-  $('exact').addEventListener('change', recalc);
+  // Turning exact mode on recounts every drawn shape from scratch (also those already counted exactly),
+  // so the user always sees the recount run.
+  $('exact').addEventListener('change', function () {
+    if ($('exact').checked) {
+      var containment = $('containment').value;
+      shapes.forEach(function (s) { delete s.results[containment]; s.declined = null; });
+      announceExact = true;
+    }
+    recalc();
+  });
 
   $('undo').addEventListener('click', function () {
     var s = shapes.pop();
