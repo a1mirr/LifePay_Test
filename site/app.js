@@ -4,7 +4,11 @@
   // H3 resolution 12: average cell ≈ 307 m², i.e. ≈ 3 256 cells per km².
   var RES = 12;
   var EARTH_RADIUS_M = 6371008.8;
-  var EXACT_LIMIT = 600000;   // above this many (estimated) cells only an estimate is shown
+  var DIRECT_LIMIT = 100000;  // up to this many (estimated) cells: one polygonToCells call
+  var AUTO_LIMIT = 600000;    // up to this many: exact count is always done (tiled, with progress)
+  var HARD_LIMIT = 50000000;  // above this many even the exact mode refuses
+  var TILE_TARGET = 40000;    // cells per tile in the tiled count
+  var TILE_MARGIN_DEG = 0.0004; // ≈ 44 m, more than a cell diameter at resolution 12
   var RENDER_LIMIT = 20000;   // above this many cells they are not drawn on the map
   var CLOSE_PX = 12;          // click this close to the first vertex to close the polygon
   var MIN_STEP_PX = 3;        // minimum distance between recorded points
@@ -28,13 +32,14 @@
   var nf0 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 0 });
   var nf3 = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 3 });
 
-  // { latlngs, layer, cells: string[] | null, containment, areaM2, estimate }
+  // { latlngs, layer, results: { [containment]: { count, cells | null } }, declined, areaM2, estimate }
   var shapes = [];
   var mode = 'poly';
   var draft = null;            // polygon mode: array of L.LatLng
   var draftLine = null, draftRubber = null;
   var freePts = null, freeLine = null, freePointer = null;
   var renderToken = 0;
+  var cancelRequested = false;
 
   var HINTS = {
     poly: 'Кликайте по карте, расставляя вершины. Закрыть: клик по первой точке, двойной клик или Enter. Esc — отмена.',
@@ -68,47 +73,163 @@
     return ring;
   }
 
-  function nextFrame() {
-    return new Promise(function (resolve) { setTimeout(resolve, 30); });
+  function yieldToUi() {
+    return new Promise(function (resolve) { setTimeout(resolve, 0); });
   }
 
   // ---- counting -----------------------------------------------------------
 
-  function computeCells(shape, containment) {
-    var ring = shape.latlngs.map(function (ll) { var w = ll.wrap(); return [w.lat, w.lng]; });
-    return h3.polygonToCellsExperimental([ring], RES, containment);
+  function shapeRing(shape) {
+    return shape.latlngs.map(function (ll) { var w = ll.wrap(); return [w.lat, w.lng]; });
   }
 
-  // Recomputes cells for shapes whose cached result is stale, then refreshes the numbers and the map.
+  function computeCells(shape, containment) {
+    return h3.polygonToCellsExperimental([shapeRing(shape)], RES, containment);
+  }
+
+  // Sutherland–Hodgman clip of a [lat, lng] ring against one half-plane.
+  function clipHalfPlane(ring, axis, bound, keepAbove) {
+    var out = [];
+    var inside = function (p) { return keepAbove ? p[axis] >= bound : p[axis] <= bound; };
+    for (var i = 0; i < ring.length; i++) {
+      var a = ring[i], b = ring[(i + 1) % ring.length];
+      var ai = inside(a), bi = inside(b);
+      if (ai !== bi) {
+        var t = (bound - a[axis]) / (b[axis] - a[axis]);
+        var q = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+        q[axis] = bound;
+        out.push(q);
+      }
+      if (bi) out.push(b);
+    }
+    return out;
+  }
+
+  function clipRect(ring, lat0, lat1, lng0, lng1) {
+    var steps = [[0, lat0, true], [0, lat1, false], [1, lng0, true], [1, lng1, false]];
+    for (var i = 0; i < steps.length; i++) {
+      ring = clipHalfPlane(ring, steps[i][0], steps[i][1], steps[i][2]);
+      if (ring.length < 3) return null;
+    }
+    return ring;
+  }
+
+  function showProgress(done, total) {
+    $('progress').hidden = done === null;
+    if (done === null) return;
+    $('bar').max = total;
+    $('bar').value = done;
+    $('progress-text').textContent = 'Тайл ' + nf0.format(done) + ' из ' + nf0.format(total) +
+      ' · ' + Math.round(done / total * 100) + '%';
+  }
+
+  // Exact count for a big shape: the bounding box is cut into tiles, each tile is counted with its own
+  // polygonToCells call (on the polygon clipped to the tile plus a margin) and only cells whose centre lies
+  // in the tile are kept, so seams neither double-count nor lose cells. The result equals a single call.
+  // Resolves to the count, or null if aborted (superseded by a newer recalc, or cancelled by the user).
+  async function countTiled(shape, containment, token) {
+    var ring = shapeRing(shape);
+    var minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    ring.forEach(function (p) {
+      minLat = Math.min(minLat, p[0]); maxLat = Math.max(maxLat, p[0]);
+      minLng = Math.min(minLng, p[1]); maxLng = Math.max(maxLng, p[1]);
+    });
+    var midLatRad = (minLat + maxLat) / 2 * Math.PI / 180;
+    var latSpanM = Math.max((maxLat - minLat) * 111195, 1);
+    var lngSpanM = Math.max((maxLng - minLng) * 111195 * Math.cos(midLatRad), 1);
+    var wanted = Math.max(1, Math.ceil(latSpanM * lngSpanM / AVG_CELL_M2 / TILE_TARGET));
+    var nLat = Math.min(wanted, Math.max(1, Math.round(Math.sqrt(wanted * latSpanM / lngSpanM))));
+    var nLng = Math.max(1, Math.ceil(wanted / nLat));
+    var dLat = (maxLat - minLat) / nLat, dLng = (maxLng - minLng) / nLng;
+    var total = nLat * nLng, done = 0, count = 0;
+
+    showProgress(0, total);
+    for (var i = 0; i < nLat; i++) {
+      for (var j = 0; j < nLng; j++) {
+        await yieldToUi();
+        if (token !== renderToken || cancelRequested) return null;
+
+        var lat0 = minLat + i * dLat, lat1 = lat0 + dLat;
+        var lng0 = minLng + j * dLng, lng1 = lng0 + dLng;
+        // Cells at the outer edge of the bounding box may have their centre outside it (overlap modes).
+        var loLat = i === 0 ? -Infinity : lat0, hiLat = i === nLat - 1 ? Infinity : lat1;
+        var loLng = j === 0 ? -Infinity : lng0, hiLng = j === nLng - 1 ? Infinity : lng1;
+        var marginLng = TILE_MARGIN_DEG / Math.max(Math.cos(Math.max(Math.abs(lat0), Math.abs(lat1)) * Math.PI / 180), 0.05);
+
+        var clipped = clipRect(ring, lat0 - TILE_MARGIN_DEG, lat1 + TILE_MARGIN_DEG, lng0 - marginLng, lng1 + marginLng);
+        if (clipped) {
+          var cells = h3.polygonToCellsExperimental([clipped], RES, containment);
+          for (var k = 0; k < cells.length; k++) {
+            var c = h3.cellToLatLng(cells[k]);
+            if (c[0] >= loLat && c[0] < hiLat && c[1] >= loLng && c[1] < hiLng) count++;
+          }
+        }
+        showProgress(++done, total);
+      }
+    }
+    return count;
+  }
+
+  $('cancel').addEventListener('click', function () { cancelRequested = true; });
+
+  // Computes what is missing for the current options, then refreshes the numbers and the map.
   async function recalc() {
     var token = ++renderToken;
+    cancelRequested = false;
     var containment = $('containment').value;
-    var stale = shapes.filter(function (s) { return s.containment !== containment; });
-    if (stale.length) {
+    var exactMode = $('exact').checked;
+
+    var pending = shapes.filter(function (s) {
+      if (s.results[containment]) return false;
+      if (s.estimate > HARD_LIMIT) return false;
+      if (s.estimate > AUTO_LIMIT) return exactMode;
+      return exactMode || s.declined !== containment;
+    });
+    if (pending.length) {
       setStatus('Считаю…');
-      await nextFrame();
+      await yieldToUi();
       if (token !== renderToken) return;
     }
 
-    stale.forEach(function (s) {
-      s.containment = containment;
-      s.cells = s.estimate > EXACT_LIMIT ? null : computeCells(s, containment);
+    for (var n = 0; n < pending.length; n++) {
+      var s = pending[n];
+      if (s.estimate <= DIRECT_LIMIT) {
+        var cells = computeCells(s, containment);
+        s.results[containment] = { count: cells.length, cells: cells };
+        continue;
+      }
+      var count = await countTiled(s, containment, token);
+      showProgress(null);
+      if (count === null) {
+        if (token !== renderToken) return;        // superseded: the newer recalc takes over
+        s.declined = containment;                 // cancelled by the user
+        if (s.estimate > AUTO_LIMIT) $('exact').checked = false;
+        continue;
+      }
+      s.results[containment] = { count: count, cells: null };
+    }
+    showProgress(null);
+
+    var withCells = [], countOnly = [], approx = [];
+    shapes.forEach(function (s) {
+      var r = s.results[containment];
+      if (!r) approx.push(s);
+      else if (r.cells) withCells.push(r);
+      else countOnly.push(r);
     });
 
-    var exact = shapes.filter(function (s) { return s.cells; });
-    var approx = shapes.filter(function (s) { return !s.cells; });
-
     var all;
-    if (exact.length === 1) {
-      all = exact[0].cells;
+    if (withCells.length === 1) {
+      all = withCells[0].cells;
     } else {
       var set = new Set();
-      exact.forEach(function (s) { s.cells.forEach(function (c) { set.add(c); }); });
+      withCells.forEach(function (r) { r.cells.forEach(function (c) { set.add(c); }); });
       all = Array.from(set);
     }
 
     var approxTotal = approx.reduce(function (sum, s) { return sum + s.estimate; }, 0);
-    var total = all.length + Math.round(approxTotal);
+    var countOnlyTotal = countOnly.reduce(function (sum, r) { return sum + r.count; }, 0);
+    var total = all.length + countOnlyTotal + Math.round(approxTotal);
     var area = shapes.reduce(function (sum, s) { return sum + s.areaM2; }, 0) / 1e6;
 
     $('count').textContent = (approx.length ? '≈ ' : '') + nf0.format(total);
@@ -116,16 +237,21 @@
     $('density').textContent = area > 0 ? nf0.format(total / area) : '—';
     $('shapes').textContent = shapes.length;
 
-    var msg = '';
+    var msgs = [];
     if (approx.length) {
-      msg = 'Область слишком большая для точного подсчёта (больше ' + nf0.format(EXACT_LIMIT) +
-        ' ячеек), показана оценка по площади.';
+      var tooBig = approx.some(function (s) { return s.estimate > HARD_LIMIT; });
+      msgs.push(tooBig
+        ? 'Одна из областей больше ' + nf0.format(HARD_LIMIT) + ' ячеек — считается только оценка по площади.'
+        : 'Для больших областей показана оценка по площади. Включите «Точный подсчёт», чтобы посчитать точно.');
+    }
+    if (countOnly.length && shapes.length > 1) {
+      msgs.push('Пересечения больших фигур с другими вычитаются не полностью.');
     }
 
     cellsLayer.clearLayers();
     if ($('show-cells').checked && all.length) {
       if (all.length > RENDER_LIMIT) {
-        msg = (msg ? msg + ' ' : '') + 'Ячеек больше ' + nf0.format(RENDER_LIMIT) + ' — на карте не рисую.';
+        msgs.push('Ячеек больше ' + nf0.format(RENDER_LIMIT) + ' — на карте не рисую.');
       } else {
         all.forEach(function (c) {
           L.polygon(cellBoundary(c), {
@@ -134,7 +260,7 @@
         });
       }
     }
-    setStatus(msg, false);
+    setStatus(msgs.join(' '), false);
   }
 
   function addShape(latlngs) {
@@ -148,7 +274,7 @@
       color: '#b45309', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.08, interactive: false
     }).addTo(shapesLayer);
     shapes.push({
-      latlngs: latlngs, layer: layer, cells: null, containment: null,
+      latlngs: latlngs, layer: layer, results: {}, declined: null,
       areaM2: areaM2, estimate: areaM2 / AVG_CELL_M2
     });
     recalc();
@@ -275,6 +401,7 @@
 
   $('containment').addEventListener('change', recalc);
   $('show-cells').addEventListener('change', recalc);
+  $('exact').addEventListener('change', recalc);
 
   $('undo').addEventListener('click', function () {
     var s = shapes.pop();
@@ -295,5 +422,5 @@
   recalc();
 
   // Exposed for tests.
-  window.__h3calc = { shapes: function () { return shapes; } };
+  window.__h3calc = { map: map, shapes: function () { return shapes; } };
 })();
