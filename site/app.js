@@ -48,6 +48,9 @@
   var renderToken = 0;
   var cancelRequested = false;
   var hugeWarned = false;      // the «very large area» popup is shown once until the page is reloaded
+  var computing = false;       // a recalc is in progress: the numbers on screen are not final yet
+  var lastCells = [];          // cells of the last finished recalc, for redrawing without recounting
+  var lastMsgs = [];           // status messages of the last finished recalc
   var announceExact = false;   // report the result of the recount triggered by the «exact» toggle
 
   var HINTS = {
@@ -482,6 +485,9 @@
     var token = ++renderToken;
     abortRun();
     cancelRequested = false;
+    computing = true;
+    lastCells = [];
+    lastMsgs = [];
     var containment = $('containment').value;
     var exactMode = $('exact').checked;
     var announce = announceExact;
@@ -573,12 +579,21 @@
       msgs.push('Пересекающиеся фигуры объединены: ячейки и площадь считаются один раз.');
     }
 
+    lastCells = all;
+    lastMsgs = msgs;
+    computing = false;
+    paintCells();
+  }
+
+  // Draws the cells of the last recalc (if «show cells» is on). Does not count anything.
+  function paintCells() {
     cellsLayer.clearLayers();
-    if ($('show-cells').checked && all.length) {
-      if (all.length > RENDER_LIMIT) {
+    var msgs = lastMsgs.slice();
+    if ($('show-cells').checked && lastCells.length) {
+      if (lastCells.length > RENDER_LIMIT) {
         msgs.push('Ячеек больше ' + nf0.format(RENDER_LIMIT) + ' — на карте не рисую.');
       } else {
-        all.forEach(function (c) {
+        lastCells.forEach(function (c) {
           L.polygon(cellBoundary(c), {
             color: '#1d4ed8', weight: 0.6, fillColor: '#3b82f6', fillOpacity: 0.3, interactive: false
           }).addTo(cellsLayer);
@@ -722,7 +737,11 @@
   L.DomEvent.disableScrollPropagation($('panel'));
 
   $('containment').addEventListener('change', recalc);
-  $('show-cells').addEventListener('change', recalc);
+  // Showing or hiding the cells only repaints; a running count must not be touched. If a count is in
+  // progress, its end paints with the then-current state of the checkbox.
+  $('show-cells').addEventListener('change', function () {
+    if (!computing) paintCells();
+  });
   // Turning exact mode on recounts every drawn shape from scratch (also those already counted exactly),
   // so the user always sees the recount run.
   $('exact').addEventListener('change', function () {
@@ -759,6 +778,7 @@
 
   // Exposed for tests.
   window.__h3calc = { map: map, shapes: function () { return shapes; }, polys: function () { return polys; },
+    cellLayers: function () { return cellsLayer.getLayers().length; },
     tiles: function () {
       if (!gridLayer) return null;
       var t = { todo: 0, run: 0, done: 0 }, st = gridLayer.grid.states;
