@@ -114,18 +114,73 @@
     return ring;
   }
 
+  var threadsParam = new URLSearchParams(location.search).get('threads');
+  var THREADS = threadsParam !== null && !isNaN(parseInt(threadsParam, 10))
+    ? Math.max(0, parseInt(threadsParam, 10))
+    : Math.min(navigator.hardwareConcurrency || 4, 16);
+  var currentRun = null;
+  var threadsLabel = '';
+
   function showProgress(done, total) {
     $('progress').hidden = done === null;
     if (done === null) return;
     $('bar').max = total;
     $('bar').value = done;
     $('progress-text').textContent = 'Тайл ' + nf0.format(done) + ' из ' + nf0.format(total) +
-      ' · ' + Math.round(done / total * 100) + '%';
+      ' · ' + Math.round(done / total * 100) + '%' + threadsLabel;
+  }
+
+  function abortRun() {
+    if (currentRun) currentRun.abort();
+  }
+
+  // Runs the tasks on a pool of Web Workers. Resolves to the total count, null if aborted,
+  // or 'fallback' if workers are unavailable or failed (the caller then counts on the main thread).
+  function runInWorkers(tasks, containment, token, onDone) {
+    return new Promise(function (resolve) {
+      var workers = [], next = 0, finished = 0, count = 0, over = false;
+
+      function end(result) {
+        if (over) return;
+        over = true;
+        workers.forEach(function (w) { w.terminate(); });
+        currentRun = null;
+        resolve(result);
+      }
+      currentRun = { abort: function () { end(null); } };
+
+      function feed(w) {
+        if (next < tasks.length) {
+          w.postMessage({ task: tasks[next++], res: RES, containment: containment });
+        }
+      }
+
+      var n = Math.min(THREADS, tasks.length);
+      try {
+        for (var i = 0; i < n; i++) {
+          var w = new Worker('worker.js');
+          w.onmessage = function (e) {
+            count += e.data.count;
+            finished++;
+            onDone();
+            if (token !== renderToken || cancelRequested) return end(null);
+            if (finished === tasks.length) return end(count);
+            feed(e.target);
+          };
+          w.onerror = function () { end('fallback'); };
+          workers.push(w);
+        }
+      } catch (err) {
+        return end('fallback');
+      }
+      workers.forEach(feed);
+    });
   }
 
   // Exact count for a big shape: the bounding box is cut into tiles, each tile is counted with its own
   // polygonToCells call (on the polygon clipped to the tile plus a margin) and only cells whose centre lies
   // in the tile are kept, so seams neither double-count nor lose cells. The result equals a single call.
+  // Tiles are independent, so they run in parallel in Web Workers (THREADS of them; ?threads=0 disables).
   // Resolves to the count, or null if aborted (superseded by a newer recalc, or cancelled by the user).
   async function countTiled(shape, containment, token) {
     var ring = shapeRing(shape);
@@ -141,40 +196,55 @@
     var nLat = Math.min(wanted, Math.max(1, Math.round(Math.sqrt(wanted * latSpanM / lngSpanM))));
     var nLng = Math.max(1, Math.ceil(wanted / nLat));
     var dLat = (maxLat - minLat) / nLat, dLng = (maxLng - minLng) / nLng;
-    var total = nLat * nLng, done = 0, count = 0;
+    var total = nLat * nLng;
 
-    showProgress(0, total);
+    var tasks = [];
     for (var i = 0; i < nLat; i++) {
       for (var j = 0; j < nLng; j++) {
-        await yieldToUi();
-        if (token !== renderToken || cancelRequested) return null;
-
         var lat0 = minLat + i * dLat, lat1 = lat0 + dLat;
         var lng0 = minLng + j * dLng, lng1 = lng0 + dLng;
-        // Cells at the outer edge of the bounding box may have their centre outside it (overlap modes).
-        var loLat = i === 0 ? -Infinity : lat0, hiLat = i === nLat - 1 ? Infinity : lat1;
-        var loLng = j === 0 ? -Infinity : lng0, hiLng = j === nLng - 1 ? Infinity : lng1;
         var marginLng = TILE_MARGIN_DEG / Math.max(Math.cos(Math.max(Math.abs(lat0), Math.abs(lat1)) * Math.PI / 180), 0.05);
-
         var clipped = clipRect(ring, lat0 - TILE_MARGIN_DEG, lat1 + TILE_MARGIN_DEG, lng0 - marginLng, lng1 + marginLng);
-        if (clipped) {
-          var cells = h3.polygonToCellsExperimental([clipped], RES, containment);
-          for (var k = 0; k < cells.length; k++) {
-            var c = h3.cellToLatLng(cells[k]);
-            if (c[0] >= loLat && c[0] < hiLat && c[1] >= loLng && c[1] < hiLng) count++;
-          }
-        }
-        showProgress(++done, total);
+        if (!clipped) continue;
+        tasks.push({
+          clipped: clipped,
+          // Cells at the outer edge of the bounding box may have their centre outside it (overlap modes).
+          loLat: i === 0 ? -Infinity : lat0, hiLat: i === nLat - 1 ? Infinity : lat1,
+          loLng: j === 0 ? -Infinity : lng0, hiLng: j === nLng - 1 ? Infinity : lng1
+        });
       }
+    }
+    var skipped = total - tasks.length;   // tiles the polygon does not reach
+
+    if (THREADS > 0 && typeof Worker !== 'undefined') {
+      threadsLabel = ' · потоков: ' + Math.min(THREADS, tasks.length);
+      var done = skipped;
+      showProgress(done, total);
+      var result = await runInWorkers(tasks, containment, token, function () { showProgress(++done, total); });
+      if (result !== 'fallback') return result;
+    }
+
+    threadsLabel = '';
+    var count = 0;
+    showProgress(skipped, total);
+    for (var t = 0; t < tasks.length; t++) {
+      await yieldToUi();
+      if (token !== renderToken || cancelRequested) return null;
+      count += countTile(h3, tasks[t], RES, containment);
+      showProgress(skipped + t + 1, total);
     }
     return count;
   }
 
-  $('cancel').addEventListener('click', function () { cancelRequested = true; });
+  $('cancel').addEventListener('click', function () {
+    cancelRequested = true;
+    abortRun();
+  });
 
   // Computes what is missing for the current options, then refreshes the numbers and the map.
   async function recalc() {
     var token = ++renderToken;
+    abortRun();
     cancelRequested = false;
     var containment = $('containment').value;
     var exactMode = $('exact').checked;
