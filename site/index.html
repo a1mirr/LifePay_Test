@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Калькулятор площади H3</title>
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map"></div>
+
+  <aside id="panel">
+    <h1>Площадь области H3</h1>
+
+    <section>
+      <label for="res">Разрешение H3: <b id="res-value">8</b></label>
+      <input id="res" type="range" min="0" max="12" value="8">
+      <p class="hint" id="res-hint"></p>
+    </section>
+
+    <section>
+      <div class="modes" role="group" aria-label="Режим выделения">
+        <button type="button" id="mode-click" class="active">Клик по ячейке</button>
+        <button type="button" id="mode-frame">Рамка</button>
+      </div>
+      <p class="hint" id="mode-hint"></p>
+    </section>
+
+    <section class="result" aria-live="polite">
+      <div class="big"><span id="area-km2">0</span> <small>км²</small></div>
+      <dl>
+        <dt>Площадь</dt><dd><span id="area-m2">0</span> м² · <span id="area-ha">0</span> га</dd>
+        <dt>Ячеек</dt><dd id="count">0</dd>
+        <dt>Разрешения</dt><dd id="breakdown">—</dd>
+      </dl>
+      <p class="status" id="status"></p>
+    </section>
+
+    <section class="actions">
+      <button type="button" id="clear">Очистить</button>
+      <button type="button" id="copy">Копировать индексы</button>
+      <button type="button" id="fit">Показать всё</button>
+    </section>
+
+    <details id="indexes-box">
+      <summary>Индексы H3</summary>
+      <textarea id="indexes" rows="6" spellcheck="false"
+                placeholder="Вставьте индексы H3 через пробел, запятую или с новой строки"></textarea>
+      <button type="button" id="add-indexes">Добавить из текста</button>
+    </details>
+  </aside>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="vendor/h3-js.umd.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
