@@ -1,5 +1,5 @@
 // Web Worker: counts one tile per message. See tile.js.
-importScripts('vendor/h3-js.umd.js', 'tile.js');
+importScripts('vendor/h3-js.umd.js', 'tile.js?v=__VERSION__');   // __VERSION__ is stamped by the deploy workflow
 
 self.onmessage = function (e) {
   var m = e.data;

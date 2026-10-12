@@ -24,6 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      - name: Stamp version
+        # The commit hash goes into the asset URLs (cache busting) and the panel footer.
+        run: sed -i "s/__VERSION__/${GITHUB_SHA::7}/g" site/index.html site/app.js site/worker.js
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
